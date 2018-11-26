@@ -31,7 +31,11 @@ func (rs byTimeStart) Less(i, j int) bool {
 // Index is an index of test run results that can ingest and evict runs.
 // FUTURE: Index will also be able to service queries.
 type Index interface {
+	// IngestRun loads the test run results associated with the input test run
+	// into the index.
 	IngestRun(*shared.TestRun) error
+	// EvictAnyRun reduces memory pressure by evicting the cache's choice of run
+	// from memory.
 	EvictAnyRun() error
 }
 
