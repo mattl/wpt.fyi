@@ -30,7 +30,6 @@ var (
 )
 
 // IndexManager is an index of test run results that can ingest and evict runs.
-// FUTURE: IndexManager will also be able to service queries.
 type IndexManager interface {
 	// IngestRun loads the test run results associated with the input test run
 	// into the index.
@@ -222,7 +221,7 @@ func filterForShard(runs []shared.TestRun, q query.ConcreteQuery, s *wptIndex) (
 		tests:      s.tests,
 		runResults: runResults,
 	}
-	return NewFilter(idx, q)
+	return newFilter(idx, q)
 }
 
 func (l httpReportLoader) Load(run shared.TestRun) (*metrics.TestResultsReport, error) {

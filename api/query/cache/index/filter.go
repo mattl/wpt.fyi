@@ -11,6 +11,41 @@ import (
 	"github.com/web-platform-tests/wpt.fyi/api/query"
 )
 
+// TestNamePattern is a query.TestNamePattern bound to an in-memory index.
+type TestNamePattern struct {
+	index
+	q query.TestNamePattern
+}
+
+// RunTestStatusConstraint is a query.RunTestStatusConstraint bound to an
+// in-memory index.
+type RunTestStatusConstraint struct {
+	index
+	q query.RunTestStatusConstraint
+}
+
+// And is a query.And bound to an in-memory index.
+type And struct {
+	index
+	args []filter
+}
+
+// Or is a query.Or bound to an in-memory index.
+type Or struct {
+	index
+	args []filter
+}
+
+// Not is a query.Not bound to an in-memory index.
+type Not struct {
+	index
+	arg filter
+}
+
+// ShardedFilter is a collection of filters, each bound to a shard of in-memory
+// index data.
+type ShardedFilter []filter
+
 type filter interface {
 	Filter(TestID) bool
 	Tests() Tests
@@ -21,37 +56,11 @@ type index struct {
 	runResults map[RunID]RunResults
 }
 
-type TestNamePattern struct {
-	index
-	q query.TestNamePattern
-}
-
-type RunTestStatusConstraint struct {
-	index
-	q query.RunTestStatusConstraint
-}
-
-type And struct {
-	index
-	args []filter
-}
-
-type Or struct {
-	index
-	args []filter
-}
-
-type Not struct {
-	index
-	arg filter
-}
-
-type ShardedFilter []filter
-
 var errUnknownConcreteQuery = errors.New("Unknown ConcreteQuery type")
 
 func (i index) Tests() Tests { return i.tests }
 
+// Filter interprets a TestNamePattern as a filter function over TestIDs.
 func (tnp TestNamePattern) Filter(t TestID) bool {
 	name, _, err := tnp.tests.GetName(t)
 	if err != nil {
@@ -60,10 +69,13 @@ func (tnp TestNamePattern) Filter(t TestID) bool {
 	return strings.Contains(name, tnp.q.Pattern)
 }
 
+// Filter interprets a RunTestStatusConstraint as a filter function over
+// TestIDs.
 func (rtsc RunTestStatusConstraint) Filter(t TestID) bool {
 	return rtsc.runResults[RunID(rtsc.q.Run)].GetResult(t) == ResultID(rtsc.q.Status)
 }
 
+// Filter interprets an And as a filter function over TestIDs.
 func (a And) Filter(t TestID) bool {
 	args := a.args
 	for _, arg := range args {
@@ -74,6 +86,7 @@ func (a And) Filter(t TestID) bool {
 	return true
 }
 
+// Filter interprets an Or as a filter function over TestIDs.
 func (o Or) Filter(t TestID) bool {
 	args := o.args
 	for _, arg := range args {
@@ -84,11 +97,12 @@ func (o Or) Filter(t TestID) bool {
 	return false
 }
 
+// Filter interprets a Not as a filter function over TestID.
 func (n Not) Filter(t TestID) bool {
 	return !n.arg.Filter(t)
 }
 
-func NewFilter(idx index, q query.ConcreteQuery) (filter, error) {
+func newFilter(idx index, q query.ConcreteQuery) (filter, error) {
 	switch v := q.(type) {
 	case query.TestNamePattern:
 		return TestNamePattern{idx, v}, nil
@@ -107,7 +121,7 @@ func NewFilter(idx index, q query.ConcreteQuery) (filter, error) {
 		}
 		return Or{idx, fs}, nil
 	case query.Not:
-		f, err := NewFilter(idx, v.Arg)
+		f, err := newFilter(idx, v.Arg)
 		if err != nil {
 			return nil, err
 		}
@@ -117,6 +131,9 @@ func NewFilter(idx index, q query.ConcreteQuery) (filter, error) {
 	}
 }
 
+// Execute runs each filter in a ShardedFilter in parallel, returning a slice of
+// TestIDs as the result. Note that TestIDs are not deduplicated; the assumption
+// is that each filter is bound to a different shard, sharded by TestID.
 func (fs ShardedFilter) Execute() (interface{}, error) {
 	res := make(chan []TestID, len(fs))
 	for _, f := range fs {
@@ -143,7 +160,7 @@ func filters(idx index, qs []query.ConcreteQuery) ([]filter, error) {
 	fs := make([]filter, len(qs))
 	var err error
 	for i := range qs {
-		fs[i], err = NewFilter(idx, qs[i])
+		fs[i], err = newFilter(idx, qs[i])
 		if err != nil {
 			return nil, err
 		}
