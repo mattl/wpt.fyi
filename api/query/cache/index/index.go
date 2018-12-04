@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/web-platform-tests/results-analysis/metrics"
+	"github.com/web-platform-tests/wpt.fyi/api/query"
 	"github.com/web-platform-tests/wpt.fyi/shared"
 
 	log "github.com/sirupsen/logrus"
@@ -28,9 +29,9 @@ var (
 	errZeroRun            = errors.New("Cannot ingest run with ID of 0")
 )
 
-// Index is an index of test run results that can ingest and evict runs.
-// FUTURE: Index will also be able to service queries.
-type Index interface {
+// IndexManager is an index of test run results that can ingest and evict runs.
+// FUTURE: IndexManager will also be able to service queries.
+type IndexManager interface {
 	// IngestRun loads the test run results associated with the input test run
 	// into the index.
 	IngestRun(shared.TestRun) error
@@ -43,7 +44,7 @@ type Index interface {
 // generally used in type embeddings that wish to override the behaviour of some
 // (but not all) methods, deferring to the delegate for all other behaviours.
 type ProxyIndex struct {
-	delegate Index
+	delegate IndexManager
 }
 
 // IngestRun loads the given run's results in to the index by deferring ot the
@@ -59,7 +60,7 @@ func (i *ProxyIndex) EvictAnyRun() error {
 }
 
 // NewProxyIndex instantiates a new proxy index bound to the given delegate.
-func NewProxyIndex(idx Index) ProxyIndex {
+func NewProxyIndex(idx IndexManager) ProxyIndex {
 	return ProxyIndex{idx}
 }
 
@@ -194,6 +195,36 @@ func (i *shardedWPTIndex) EvictAnyRun() error {
 	return nil
 }
 
+func (i *shardedWPTIndex) Bind(runs []shared.TestRun, aq query.AbstractQuery) (query.Query, error) {
+	q := aq.BindToRuns(runs)
+	fs := make(ShardedFilter, len(i.shards))
+	for j, s := range i.shards {
+		f, err := filterForShard(runs, q, s)
+		if err != nil {
+			return nil, err
+		}
+		fs[j] = f
+	}
+	return fs, nil
+}
+
+func filterForShard(runs []shared.TestRun, q query.ConcreteQuery, s *wptIndex) (filter, error) {
+	runResults := make(map[RunID]RunResults)
+	for _, run := range runs {
+		runID := RunID(run.ID)
+		forRun := s.results.ForRun(runID)
+		if forRun == nil {
+			return nil, fmt.Errorf("Missing result for run %v", run)
+		}
+		runResults[runID] = forRun
+	}
+	idx := index{
+		tests:      s.tests,
+		runResults: runResults,
+	}
+	return NewFilter(idx, q)
+}
+
 func (l httpReportLoader) Load(run shared.TestRun) (*metrics.TestResultsReport, error) {
 	// Attempt to fetch-and-unmarshal run from run.RawResultsURL.
 	resp, err := http.Get(run.RawResultsURL)
@@ -220,7 +251,7 @@ func (l httpReportLoader) Load(run shared.TestRun) (*metrics.TestResultsReport, 
 }
 
 // NewShardedWPTIndex creates a new empty Index for WPT test run results.
-func NewShardedWPTIndex(loader ReportLoader, numShards int) (Index, error) {
+func NewShardedWPTIndex(loader ReportLoader, numShards int) (IndexManager, error) {
 	if numShards <= 0 {
 		return nil, errSomeShardsRequired
 	}

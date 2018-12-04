@@ -26,8 +26,7 @@ type Tests interface {
 	// the index does not recognize the TestID, then an error is returned.
 	GetName(TestID) (string, *string, error)
 
-	// TODO: Add filter binding function:
-	// TestFilter(q string) UnboundFilter
+	Range(func(TestID) bool)
 }
 
 // Tests is an indexing component that provides fast test name lookup by TestID.
@@ -63,10 +62,9 @@ func (ts *testsMap) GetName(id TestID) (string, *string, error) {
 	return name.name, name.subName, nil
 }
 
-// TODO: Add filter binding function:
-// func TestFilter(q string) UnboundFilter {
-// 	return NewTestNameFilter(q)
-// }
+func (ts *testsMap) Range(f func(TestID) bool) {
+	ts.tests.Range(func(key, value interface{}) bool { return f(key.(TestID)) })
+}
 
 func computeID(name string, subPtr *string) (TestID, error) {
 	var s uint64
