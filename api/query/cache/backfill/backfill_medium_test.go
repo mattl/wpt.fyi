@@ -13,35 +13,10 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/web-platform-tests/wpt.fyi/api/query/cache/index"
+	"github.com/web-platform-tests/wpt.fyi/api/query/cache/indextest"
 	"github.com/web-platform-tests/wpt.fyi/api/query/cache/monitor"
 	shared "github.com/web-platform-tests/wpt.fyi/shared"
 )
-
-type countingIndex struct {
-	index.ProxyIndex
-
-	count int
-}
-
-func (i *countingIndex) IngestRun(r shared.TestRun) error {
-	err := i.ProxyIndex.IngestRun(r)
-	if err != nil {
-		return err
-	}
-
-	i.count++
-	return nil
-}
-
-func (i *countingIndex) EvictAnyRun() error {
-	err := i.ProxyIndex.EvictAnyRun()
-	if err != nil {
-		return err
-	}
-
-	i.count--
-	return nil
-}
 
 func TestStopImmediately(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -57,12 +32,12 @@ func TestStopImmediately(t *testing.T) {
 	rt.EXPECT().GetHeapBytes().Return(uint64(0)).AnyTimes()
 	mockIdx := index.NewMockIndex(ctrl)
 	mockIdx.EXPECT().IngestRun(gomock.Any()).Return(nil).AnyTimes()
-	idx := countingIndex{index.NewProxyIndex(mockIdx), 0}
-	m, err := FillIndex(fetcher, shared.NewNilLogger(), rt, time.Millisecond*10, 1, &idx)
+	idx := indextest.NewCountingIndex(mockIdx)
+	m, err := FillIndex(fetcher, shared.NewNilLogger(), rt, time.Millisecond*10, 1, idx)
 	assert.Nil(t, err)
 	m.Stop()
 	time.Sleep(time.Second)
-	assert.True(t, idx.count == 0 || idx.count == 1)
+	assert.True(t, idx.Count() == 0 || idx.Count() == 1)
 }
 
 func TestIngestSomeRuns(t *testing.T) {
@@ -82,11 +57,11 @@ func TestIngestSomeRuns(t *testing.T) {
 	rt := monitor.NewMockRuntime(ctrl)
 
 	mockIdx := index.NewMockIndex(ctrl)
-	idx := countingIndex{index.NewProxyIndex(mockIdx), 0}
+	idx := indextest.NewCountingIndex(mockIdx)
 
 	rt.EXPECT().GetHeapBytes().DoAndReturn(func() uint64 {
 		// Trigger monitor when 3 or more runs are loaded.
-		if idx.count >= 3 {
+		if idx.Count() >= 3 {
 			return maxBytes + 1
 		} else {
 			return uint64(0)
@@ -102,11 +77,11 @@ func TestIngestSomeRuns(t *testing.T) {
 
 	mockIdx.EXPECT().EvictAnyRun().Return(nil).AnyTimes()
 
-	m, err := FillIndex(fetcher, shared.NewNilLogger(), rt, freq, maxBytes, &idx)
+	m, err := FillIndex(fetcher, shared.NewNilLogger(), rt, freq, maxBytes, idx)
 	assert.Nil(t, err)
 	defer m.Stop()
 
 	// Wait for runs to be ingested.
 	time.Sleep(time.Second)
-	assert.Equal(t, 2, idx.count)
+	assert.Equal(t, 2, idx.Count())
 }
