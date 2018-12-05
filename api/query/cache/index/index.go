@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 
+	mapset "github.com/deckarep/golang-set"
 	"github.com/web-platform-tests/results-analysis/metrics"
 	"github.com/web-platform-tests/wpt.fyi/api/query"
 	"github.com/web-platform-tests/wpt.fyi/shared"
@@ -21,16 +22,19 @@ import (
 )
 
 var (
-	errNoRuns             = errors.New("No runs")
 	errNilRun             = errors.New("Test run is nil")
+	errNoQuery            = errors.New("No query provided")
+	errNoRuns             = errors.New("No runs")
 	errRunExists          = errors.New("Run already exists in index")
 	errRunLoading         = errors.New("Run currently being loaded into index")
 	errSomeShardsRequired = errors.New("Index must have at least one shard")
 	errZeroRun            = errors.New("Cannot ingest run with ID of 0")
 )
 
-// IndexManager is an index of test run results that can ingest and evict runs.
-type IndexManager interface {
+// Index is an index of test run results that can ingest and evict runs.
+type Index interface {
+	query.Binder
+
 	// IngestRun loads the test run results associated with the input test run
 	// into the index.
 	IngestRun(shared.TestRun) error
@@ -43,7 +47,7 @@ type IndexManager interface {
 // generally used in type embeddings that wish to override the behaviour of some
 // (but not all) methods, deferring to the delegate for all other behaviours.
 type ProxyIndex struct {
-	delegate IndexManager
+	delegate Index
 }
 
 // IngestRun loads the given run's results in to the index by deferring ot the
@@ -59,7 +63,7 @@ func (i *ProxyIndex) EvictAnyRun() error {
 }
 
 // NewProxyIndex instantiates a new proxy index bound to the given delegate.
-func NewProxyIndex(idx IndexManager) ProxyIndex {
+func NewProxyIndex(idx Index) ProxyIndex {
 	return ProxyIndex{idx}
 }
 
@@ -70,16 +74,21 @@ type ReportLoader interface {
 }
 
 type shardedWPTIndex struct {
-	runs     sync.Map
-	inFlight sync.Map
+	runs     map[RunID]shared.TestRun
+	inFlight mapset.Set
 	loader   ReportLoader
-	tests    Tests
 	shards   []*wptIndex
+	m        *sync.Mutex
 }
 
 type wptIndex struct {
 	tests   Tests
 	results Results
+}
+
+type testData struct {
+	testName
+	ResultID
 }
 
 type httpReportLoader struct{}
@@ -89,18 +98,10 @@ func (i *shardedWPTIndex) IngestRun(r shared.TestRun) error {
 	if r.ID == 0 {
 		return errZeroRun
 	}
-	id := RunID(r.ID)
-	_, wasLoaded := i.runs.Load(id)
-	if wasLoaded {
-		return errRunExists
+	if err := i.syncMarkInProgress(r); err != nil {
+		return err
 	}
-	// LoadOrStore will mark this run as in-flight if it is not already marked as
-	// such.
-	_, isLoading := i.inFlight.LoadOrStore(id, r)
-	defer i.inFlight.Delete(id)
-	if isLoading {
-		return errRunLoading
-	}
+	defer i.syncClearInProgress(r)
 
 	// Delegate loader to construct complete run report.
 	report, err := i.loader.Load(r)
@@ -112,21 +113,30 @@ func (i *shardedWPTIndex) IngestRun(r shared.TestRun) error {
 	// top-level test (i.e., not subtests) integral ID of each test in the report.
 	//
 	// Create RunResults for each shard's partition of this run's results.
-	numShards := uint64(len(i.shards))
-	runResults := make([]RunResults, numShards)
-	for j := uint64(0); j < numShards; j++ {
-		runResults[j] = NewRunResults()
+	numShards := len(i.shards)
+	numShardsU64 := uint64(numShards)
+	shardData := make([]map[TestID]testData, numShards)
+	for j := 0; j < numShards; j++ {
+		shardData[j] = make(map[TestID]testData)
 	}
 
 	for _, res := range report.Results {
 		// Add top-level test (i.e., not subtest) result to appropriate shard.
-		re := ResultID(metrics.TestStatusFromString(res.Status))
-		t, err := i.tests.Add(res.Test, nil)
+		t, err := computeTestID(res.Test, nil)
 		if err != nil {
 			return err
 		}
-		runResultsForShard := runResults[int(t.testID%numShards)]
-		runResultsForShard.Add(re, t)
+
+		shardIdx := int(t.testID % numShardsU64)
+		dataForShard := shardData[shardIdx]
+		re := ResultID(shared.TestStatusValueFromString(res.Status))
+		dataForShard[t] = testData{
+			testName: testName{
+				name:    res.Test,
+				subName: nil,
+			},
+			ResultID: re,
+		}
 
 		// Dedup subtests, warning when subtest names are duplicated.
 		subs := make(map[string]metrics.SubTest)
@@ -141,87 +151,58 @@ func (i *shardedWPTIndex) IngestRun(r shared.TestRun) error {
 		// Add each subtests' result to the appropriate shard (same shard as
 		// top-level test).
 		for _, sub := range subs {
-			re := ResultID(metrics.SubTestStatusFromString(sub.Status))
-			t, err := i.tests.Add(res.Test, &sub.Name)
+			t, err := computeTestID(res.Test, &sub.Name)
 			if err != nil {
 				return err
 			}
 
-			runResultsForShard.Add(re, t)
+			re := ResultID(shared.TestStatusValueFromString(sub.Status))
+			dataForShard[t] = testData{
+				testName: testName{
+					name:    res.Test,
+					subName: &sub.Name,
+				},
+				ResultID: re,
+			}
 		}
 	}
 
-	// Add accumulated RunResults to shards.
-	for j := range runResults {
-		err := i.shards[j].results.Add(id, runResults[j])
-		if err != nil {
-			return err
-		}
-	}
-
-	// Mark run as successfully stored in index.
-	i.runs.Store(id, r)
+	i.syncStoreRun(r, shardData)
 
 	return nil
 }
 
 func (i *shardedWPTIndex) EvictAnyRun() error {
-	// Accumulate runs into sortable collection.
-	runs := make(shared.TestRuns, 0)
-	i.runs.Range(func(key, value interface{}) bool {
-		run := value.(shared.TestRun)
-		runs = append(runs, run)
-		return true
-	})
-	if len(runs) == 0 {
-		return errNoRuns
-	}
-
-	// Sort and mark and select oldest run for eviction.
-	sort.Sort(runs)
-	runIDToEvict := RunID(runs[0].ID)
-
-	// Delete run from runs-in-index collection.
-	i.runs.Delete(runIDToEvict)
-
-	// Delete run results from each shard.
-	for j, shard := range i.shards {
-		if err := shard.results.Delete(runIDToEvict); err != nil {
-			log.Warningf(`Error while evicting run from shard %d: %v`, j, err)
-		}
-	}
-
-	return nil
+	return i.syncEvictRun()
 }
 
-func (i *shardedWPTIndex) Bind(runs []shared.TestRun, aq query.AbstractQuery) (query.Query, error) {
+func (i *shardedWPTIndex) Bind(runs []shared.TestRun, aq query.AbstractQuery) (query.Plan, error) {
+	if len(runs) == 0 {
+		return nil, errNoRuns
+	}
+	if aq == nil {
+		return nil, errNoQuery
+	}
+
+	ids := make([]RunID, len(runs))
+	for j, run := range runs {
+		ids[j] = RunID(run.ID)
+	}
+	idxs, err := i.syncExtractRuns(ids)
+	if err != nil {
+		return nil, err
+	}
+
 	q := aq.BindToRuns(runs)
-	fs := make(ShardedFilter, len(i.shards))
-	for j, s := range i.shards {
-		f, err := filterForShard(runs, q, s)
+	fs := make(ShardedFilter, len(idxs))
+	for j, idx := range idxs {
+		f, err := newFilter(idx, q)
 		if err != nil {
 			return nil, err
 		}
 		fs[j] = f
 	}
 	return fs, nil
-}
-
-func filterForShard(runs []shared.TestRun, q query.ConcreteQuery, s *wptIndex) (filter, error) {
-	runResults := make(map[RunID]RunResults)
-	for _, run := range runs {
-		runID := RunID(run.ID)
-		forRun := s.results.ForRun(runID)
-		if forRun == nil {
-			return nil, fmt.Errorf("Missing result for run %v", run)
-		}
-		runResults[runID] = forRun
-	}
-	idx := index{
-		tests:      s.tests,
-		runResults: runResults,
-	}
-	return newFilter(idx, q)
 }
 
 func (l httpReportLoader) Load(run shared.TestRun) (*metrics.TestResultsReport, error) {
@@ -250,22 +231,23 @@ func (l httpReportLoader) Load(run shared.TestRun) (*metrics.TestResultsReport, 
 }
 
 // NewShardedWPTIndex creates a new empty Index for WPT test run results.
-func NewShardedWPTIndex(loader ReportLoader, numShards int) (IndexManager, error) {
+func NewShardedWPTIndex(loader ReportLoader, numShards int) (Index, error) {
 	if numShards <= 0 {
 		return nil, errSomeShardsRequired
 	}
 
 	shards := make([]*wptIndex, 0, numShards)
-	tests := NewTests()
 	for i := 0; i < numShards; i++ {
+		tests := NewTests()
 		shards = append(shards, newWPTIndex(tests))
 	}
+
 	return &shardedWPTIndex{
-		runs:     sync.Map{},
-		inFlight: sync.Map{},
+		runs:     make(map[RunID]shared.TestRun),
+		inFlight: mapset.NewSet(),
 		loader:   loader,
-		tests:    tests,
 		shards:   shards,
+		m:        &sync.Mutex{},
 	}, nil
 }
 
@@ -273,6 +255,113 @@ func NewShardedWPTIndex(loader ReportLoader, numShards int) (IndexManager, error
 // a shared.TestRun.RawResultsURL.
 func NewReportLoader() ReportLoader {
 	return httpReportLoader{}
+}
+
+func (i *shardedWPTIndex) syncMarkInProgress(run shared.TestRun) error {
+	i.m.Lock()
+	defer i.m.Unlock()
+
+	id := RunID(run.ID)
+	_, loaded := i.runs[id]
+	if loaded {
+		return errRunExists
+	}
+	if i.inFlight.Contains(id) {
+		return errRunLoading
+	}
+
+	i.inFlight.Add(id)
+
+	return nil
+}
+
+func (i *shardedWPTIndex) syncClearInProgress(run shared.TestRun) error {
+	i.m.Lock()
+	defer i.m.Unlock()
+
+	id := RunID(run.ID)
+	if !i.inFlight.Contains(id) {
+		return errNilRun
+	}
+
+	i.inFlight.Remove(id)
+
+	return nil
+}
+
+func (i *shardedWPTIndex) syncStoreRun(run shared.TestRun, data []map[TestID]testData) error {
+	i.m.Lock()
+	defer i.m.Unlock()
+
+	id := RunID(run.ID)
+	for j, shardData := range data {
+		runResults := NewRunResults()
+		for t, data := range shardData {
+			i.shards[j].tests.Add(t, data.testName.name, data.testName.subName)
+			runResults.Add(data.ResultID, t)
+		}
+		err := i.shards[j].results.Add(id, runResults)
+		if err != nil {
+			return err
+		}
+	}
+	i.runs[id] = run
+
+	return nil
+}
+
+func (i *shardedWPTIndex) syncEvictRun() error {
+	i.m.Lock()
+	defer i.m.Unlock()
+
+	if len(i.runs) == 0 {
+		return errNoRuns
+	}
+
+	// Accumulate runs into sortable collection.
+	runs := make(shared.TestRuns, 0, len(i.runs))
+	for _, run := range i.runs {
+		runs = append(runs, run)
+	}
+
+	// Sort and mark oldest run for eviction.
+	sort.Sort(runs)
+	id := RunID(runs[0].ID)
+
+	// Delete data from shards, and from runs collection.
+	for _, shard := range i.shards {
+		err := shard.results.Delete(id)
+		if err != nil {
+			return err
+		}
+	}
+	delete(i.runs, id)
+
+	return nil
+}
+
+func (i *shardedWPTIndex) syncExtractRuns(ids []RunID) ([]index, error) {
+	i.m.Lock()
+	defer i.m.Unlock()
+
+	idxs := make([]index, len(i.shards))
+	for j, shard := range i.shards {
+		tests := shard.tests
+		runResults := make(map[RunID]RunResults)
+		for _, id := range ids {
+			rrs := shard.results.ForRun(id)
+			if rrs == nil {
+				return nil, fmt.Errorf("Run is unknown to shard: RunID=%v", id)
+			}
+			runResults[id] = shard.results.ForRun(id)
+		}
+		idxs[j] = index{
+			tests:      tests,
+			runResults: runResults,
+		}
+	}
+
+	return idxs, nil
 }
 
 func newWPTIndex(tests Tests) *wptIndex {

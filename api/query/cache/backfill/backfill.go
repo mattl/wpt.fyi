@@ -12,6 +12,7 @@ import (
 	"google.golang.org/api/option"
 
 	"cloud.google.com/go/datastore"
+	"github.com/web-platform-tests/wpt.fyi/api/query"
 	"github.com/web-platform-tests/wpt.fyi/api/query/cache/index"
 	"github.com/web-platform-tests/wpt.fyi/api/query/cache/monitor"
 	"github.com/web-platform-tests/wpt.fyi/shared"
@@ -86,6 +87,10 @@ func (f datastoreRunFetcher) FetchRuns(limit int) ([]shared.TestRun, error) {
 func (i *backfillIndex) EvictAnyRun() error {
 	i.backfilling = false
 	return i.ProxyIndex.EvictAnyRun()
+}
+
+func (*backfillIndex) Bind([]shared.TestRun, query.AbstractQuery) (query.Plan, error) {
+	return nil, nil
 }
 
 func (m *backfillMonitor) Stop() error {
