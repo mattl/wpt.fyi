@@ -82,6 +82,18 @@ def _push_to_spanner(_, test_run_id):
         _log.error('Bad status code from push-to-spanner API: %d',
                    response.status_code)
 
+def _push_to_cache(_, test_run_id):
+    # Authenticate as "_search_cache" for push-to-search-cache API.
+    secret = _get_uploader_password('_search_cache')
+    response = requests.put(
+        '{}/api/search/cache/push_run?run_id={}'.format(
+            config.project_baseurl(), test_run_id),
+        auth=('_search_cache', secret))
+    if not response.ok:
+        _log.error('Bad status code from push-to-search-cache API: %d',
+                   response.status_code)
+
+
 
 # ==== End of tasks  ====
 
@@ -96,7 +108,7 @@ def _after_new_run(report, test_run_id):
     Returns:
         A list of strings, names of the tasks that run successfully.
     """
-    tasks = []
+    tasks = [_push_to_cache]
     success = []
     for task in tasks:
         _log.info('Running post-new-run task: %s', task.__name__)
